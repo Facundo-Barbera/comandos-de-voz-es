@@ -1,0 +1,19 @@
+[project]
+name = "comandos-de-voz-es"
+version = "1.0.0"
+description = "Spanish voice command recognition with a denoising autoencoder"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "tensorflow==2.18.*",
+    "tensorflow-metal==1.2.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "numpy>=1.26,<2.1",
+    "pandas>=2.2",
+    "scikit-learn>=1.5",
+    "matplotlib>=3.9",
+    "soundfile>=0.12",
+    "librosa>=0.10",
+    "tqdm>=4.66",
+    "jupyterlab>=4.2",
+    "ipykernel>=6.29",
+]
