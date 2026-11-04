@@ -13,23 +13,10 @@ def load_noise():
     return {split: data[split].astype(np.float32) / 32768 for split in ["train", "dev", "test"]}
 
 
-def loud_windows(audio, threshold_db=-60, hop=SAMPLE_RATE // 10):
-    energy = np.cumsum(audio**2, axis=1)
-    energy = np.concatenate([np.zeros((len(audio), 1), np.float32), energy], axis=1)
-    starts = np.arange(0, audio.shape[1] - SAMPLE_RATE + 1, hop)
-    level_db = 10 * np.log10((energy[:, starts + SAMPLE_RATE] - energy[:, starts]) / SAMPLE_RATE + 1e-12)
-    clip, k = np.nonzero(level_db > threshold_db)
-    return np.stack([clip, starts[k]], axis=1)
-
-
-class NoiseBank:
-    def __init__(self, audio):
-        self.audio = audio
-        self.windows = loud_windows(audio)
-
-    def sample(self, n, rng):
-        clip, start = self.windows[rng.integers(len(self.windows), size=n)].T
-        return self.audio[clip[:, None], start[:, None] + np.arange(SAMPLE_RATE)]
+def random_noise(noise, n, rng):
+    clip = rng.integers(len(noise), size=n)
+    start = rng.integers(noise.shape[1] - SAMPLE_RATE + 1, size=n)
+    return noise[clip[:, None], start[:, None] + np.arange(SAMPLE_RATE)]
 
 
 def mix(speech, noise, snr_db, silence_level_db):
@@ -49,16 +36,12 @@ def time_shift(audio, rng, max_shift=1600):
     return np.where(inside, moved, 0.0)
 
 
-def add_fixed_noise(audio, bank, snr, seed=1234):
+def add_fixed_noise(audio, noise, snr, seed=1234):
     rng = np.random.default_rng(seed)
     n = len(audio)
-    noise = bank.sample(n, rng)
     silence_level = rng.uniform(-50, -15, n)
-    if snr == "random":
-        snr_db = rng.uniform(-5, 20, n)
-    else:
-        snr_db = np.full(n, 0.0 if snr is None else float(snr))
-    mixed = mix(audio, noise, snr_db, silence_level)
+    snr_db = rng.uniform(-5, 20, n) if snr == "random" else np.full(n, 0.0 if snr is None else float(snr))
+    mixed = mix(audio, random_noise(noise, n, rng), snr_db, silence_level)
     if snr is None:
         no_speech = (audio**2).mean(axis=1) < 1e-8
         mixed = np.where(no_speech[:, None], mixed, audio)

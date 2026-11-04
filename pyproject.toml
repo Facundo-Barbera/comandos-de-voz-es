@@ -16,4 +16,5 @@ dependencies = [
     "tqdm>=4.66",
     "jupyterlab>=4.2",
     "ipykernel>=6.29",
+    "sounddevice>=0.5",
 ]

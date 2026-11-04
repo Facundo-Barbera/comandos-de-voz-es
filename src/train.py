@@ -4,93 +4,73 @@ import time
 import keras
 import numpy as np
 
-from src.config import MODELS_DIR, N_CLASSES, SEED, SILENCE
-from src.data import NoiseBank, add_fixed_noise, mix, time_shift
+from src.config import MODELS_DIR, SEED, SILENCE
+from src.data import add_fixed_noise, mix, random_noise, time_shift
 from src.features import LogMel
-from src.model import ReconstructionLoss, build_model
+from src.model import (ReconstructionLoss, build_autoencoder, build_finetune_model, build_frozen_model,
+                       build_joint_model)
 
-LAMBDAS = {"base": 0.0, "multitask": 0.3}
-EPOCHS = 30
+MODELS = ["joint", "frozen", "finetune"]
+LAMBDA = 0.3
+EPOCHS = {"autoencoder": 30, "joint": 30, "frozen": 15, "finetune": 15}
+LEARNING_RATE = {"autoencoder": 1e-3, "joint": 1e-3, "frozen": 1e-3, "finetune": 1e-4}
 BATCH_SIZE = 256
 
 
-class NoisyBatches(keras.utils.PyDataset):
-    def __init__(self, x, y, noise_bank, with_reconstruction, steps, **kwargs):
-        super().__init__(**kwargs)
-        self.x, self.y, self.noise_bank = x, y, noise_bank
-        self.with_reconstruction = with_reconstruction
-        self.steps = steps
-        weight = np.bincount(y)[y] ** -0.5
-        self.probability = weight / weight.sum()
-        self.rng = np.random.default_rng(SEED)
-
-    def __len__(self):
-        return self.steps
-
-    def __getitem__(self, _):
-        rng, n = self.rng, BATCH_SIZE
-        index = rng.choice(len(self.y), n, p=self.probability)
-        clean = time_shift(self.x[index], rng)
-
-        noisy = mix(clean, self.noise_bank.sample(n, rng),
+def noisy_batches(x, y, noise, outputs, seed=SEED):
+    rng = np.random.default_rng(seed)
+    weight = np.bincount(y)[y] ** -0.5
+    probability = weight / weight.sum()
+    n = BATCH_SIZE
+    while True:
+        index = rng.choice(len(y), n, p=probability)
+        clean = time_shift(x[index], rng)
+        noisy = mix(clean, random_noise(noise, n, rng),
                     snr_db=rng.uniform(-5, 20, n), silence_level_db=rng.uniform(-50, -15, n))
         no_speech = (clean**2).mean(axis=1) < 1e-8
         gets_noise = (rng.random(n) < 0.8) | no_speech
         noisy = np.where(gets_noise[:, None], noisy, clean)
 
         volume = 10 ** (rng.uniform(-6, 6, (n, 1)) / 20)
-        targets = {"label": np.eye(N_CLASSES, dtype="float32")[self.y[index]]}
-        if self.with_reconstruction:
-            targets["reconstruction"] = (clean * volume).astype("float32")
-        return (noisy * volume).astype("float32"), targets
+        targets = {"label": y[index], "reconstruction": (clean * volume).astype("float32")}
+        yield (noisy * volume).astype("float32"), {key: targets[key] for key in outputs}
 
 
-def validation_set(x_dev, y_dev, noise_bank):
-    x_val = np.concatenate([add_fixed_noise(x_dev, noise_bank, None, seed=7),
-                            add_fixed_noise(x_dev, noise_bank, "random", seed=99)])
+def validation_set(x_dev, y_dev, noise):
+    x_val = np.concatenate([add_fixed_noise(x_dev, noise, None, seed=7),
+                            add_fixed_noise(x_dev, noise, "random", seed=99)])
     return x_val, np.concatenate([y_dev, y_dev]), np.concatenate([x_dev, x_dev])
 
 
-def compile_model(model, lam, total_steps):
-    warmup = int(0.15 * total_steps)
-    learning_rate = keras.optimizers.schedules.CosineDecay(
-        initial_learning_rate=3e-3 / 25, decay_steps=total_steps - warmup, alpha=1e-3,
-        warmup_target=3e-3, warmup_steps=warmup)
-
-    losses = {"label": keras.losses.CategoricalCrossentropy(label_smoothing=0.05)}
-    weights = {"label": 1.0}
-    if lam > 0:
-        losses["reconstruction"] = ReconstructionLoss(model.get_layer("logmel"))
-        weights["reconstruction"] = lam
-    model.compile(optimizer=keras.optimizers.AdamW(learning_rate, weight_decay=1e-3),
-                  loss=losses, loss_weights=weights, metrics={"label": ["accuracy"]})
-
-
-def train_model(name, x_train, y_train, x_dev, y_dev, noise, epochs=EPOCHS, out_dir=MODELS_DIR):
-    lam = LAMBDAS[name]
-    keras.utils.set_random_seed(SEED)
+def adapted_logmel(x_train, y_train):
     logmel = LogMel(name="logmel")
     logmel.adapt(x_train[y_train != SILENCE][:6000])
-    model = build_model(with_decoder=lam > 0, logmel=logmel)
+    return logmel
 
-    steps = len(y_train) // BATCH_SIZE
-    compile_model(model, lam, epochs * steps)
-    batches = NoisyBatches(x_train, y_train, NoiseBank(noise["train"]), with_reconstruction=lam > 0, steps=steps)
 
-    x_val, y_val, x_val_clean = validation_set(x_dev, y_dev, NoiseBank(noise["dev"]))
-    val_targets = {"label": np.eye(N_CLASSES, dtype="float32")[y_val]}
-    if lam > 0:
-        val_targets["reconstruction"] = x_val_clean
+def fit(model, name, losses, loss_weights, monitor, data, epochs, out_dir):
+    x_train, y_train, x_dev, y_dev, noise = data
+    model.compile(optimizer=keras.optimizers.Adam(LEARNING_RATE[name]), loss=losses, loss_weights=loss_weights,
+                  metrics={"label": ["accuracy"]} if "label" in losses else None)
 
-    metric = "val_label_accuracy" if lam > 0 else "val_accuracy"
+    x_val, y_val, x_val_clean = validation_set(x_dev, y_dev, noise["dev"])
+    val_targets = {key: {"label": y_val, "reconstruction": x_val_clean}[key] for key in losses}
+    sample_labels = y_train if "label" in losses else np.zeros_like(y_train)
+
+    mode = "min" if monitor == "val_loss" else "max"
     out_dir.mkdir(parents=True, exist_ok=True)
     weights_path = out_dir / f"{name}.weights.h5"
-    keep_best = keras.callbacks.ModelCheckpoint(
-        weights_path, monitor=metric, mode="max", save_best_only=True, save_weights_only=True)
+    callbacks = [
+        keras.callbacks.ReduceLROnPlateau(monitor=monitor, mode=mode, factor=0.5, patience=3),
+        keras.callbacks.ModelCheckpoint(weights_path, monitor=monitor, mode=mode,
+                                        save_best_only=True, save_weights_only=True),
+    ]
 
     start = time.time()
-    history = model.fit(batches, epochs=epochs, validation_data=(x_val, val_targets),
-                        validation_batch_size=512, callbacks=[keep_best], verbose=2)
+    history = model.fit(noisy_batches(x_train, sample_labels, noise["train"], list(losses)),
+                        steps_per_epoch=len(y_train) // BATCH_SIZE, epochs=epochs,
+                        validation_data=(x_val, val_targets), validation_batch_size=512,
+                        callbacks=callbacks, verbose=2)
     print(f"{name}: {(time.time() - start) / 60:.1f} minutes")
 
     history = {key: [float(v) for v in values] for key, values in history.history.items()}
@@ -99,7 +79,49 @@ def train_model(name, x_train, y_train, x_dev, y_dev, noise, epochs=EPOCHS, out_
     return model
 
 
+def train_joint(data, epochs, out_dir):
+    model = build_joint_model(adapted_logmel(*data[:2]))
+    losses = {"label": keras.losses.SparseCategoricalCrossentropy(),
+              "reconstruction": ReconstructionLoss(model.get_layer("logmel"))}
+    return fit(model, "joint", losses, {"label": 1.0, "reconstruction": LAMBDA}, "val_label_accuracy",
+               data, epochs, out_dir)
+
+
+def pretrained_autoencoder(data, out_dir):
+    if (out_dir / "autoencoder.weights.h5").exists():
+        autoencoder = build_autoencoder()
+        autoencoder.load_weights(out_dir / "autoencoder.weights.h5")
+        return autoencoder
+    autoencoder = build_autoencoder(adapted_logmel(*data[:2]))
+    losses = {"reconstruction": ReconstructionLoss(autoencoder.get_layer("logmel"))}
+    return fit(autoencoder, "autoencoder", losses, None, "val_loss", data, EPOCHS["autoencoder"], out_dir)
+
+
+def train_frozen(data, epochs, out_dir):
+    model = build_frozen_model(pretrained_autoencoder(data, out_dir))
+    losses = {"label": keras.losses.SparseCategoricalCrossentropy()}
+    return fit(model, "frozen", losses, None, "val_accuracy", data, epochs, out_dir)
+
+
+def train_finetune(data, epochs, out_dir):
+    if not (out_dir / "frozen.weights.h5").exists():
+        train_frozen(data, EPOCHS["frozen"], out_dir)
+    model = build_finetune_model(build_autoencoder())
+    model.load_weights(out_dir / "frozen.weights.h5")
+    losses = {"label": keras.losses.SparseCategoricalCrossentropy()}
+    return fit(model, "finetune", losses, None, "val_accuracy", data, epochs, out_dir)
+
+
+def train_model(name, x_train, y_train, x_dev, y_dev, noise, epochs=None, out_dir=MODELS_DIR):
+    keras.utils.set_random_seed(SEED)
+    train = {"joint": train_joint, "frozen": train_frozen, "finetune": train_finetune}[name]
+    return train((x_train, y_train, x_dev, y_dev, noise), epochs or EPOCHS[name], out_dir)
+
+
 def load_model(name, models_dir=MODELS_DIR):
-    model = build_model(with_decoder=LAMBDAS[name] > 0)
+    if name == "joint":
+        model = build_joint_model()
+    else:
+        model = {"frozen": build_frozen_model, "finetune": build_finetune_model}[name](build_autoencoder())
     model.load_weights(models_dir / f"{name}.weights.h5")
     return model

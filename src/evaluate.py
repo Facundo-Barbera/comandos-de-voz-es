@@ -6,8 +6,8 @@ SNRS = [20, 10, 5, 0, -5]
 CONDITIONS = {"clean": None, **{f"{snr} dB": snr for snr in SNRS}}
 
 
-def test_sets(x_test, noise_bank):
-    return {condition: add_fixed_noise(x_test, noise_bank, snr) for condition, snr in CONDITIONS.items()}
+def test_sets(x_test, noise):
+    return {condition: add_fixed_noise(x_test, noise, snr) for condition, snr in CONDITIONS.items()}
 
 
 def predict_labels(model, audio):
